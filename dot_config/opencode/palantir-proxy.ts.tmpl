@@ -1,0 +1,82 @@
+import { spawn } from "node:child_process";
+import { closeSync, existsSync, openSync } from "node:fs";
+
+const PROXY_DIR = "{{ .chezmoi.homeDir }}/Develop/palantir-chat";
+const PROXY_ENTRY = `${PROXY_DIR}/openai-server.mjs`;
+const NODE_BIN = "/usr/bin/node";
+const HEALTH_URL = "http://127.0.0.1:8788/health";
+const LOG_FILE = "/tmp/palantir-openai-proxy.log";
+const STRIPPED_ENV = [
+  "AGENT_RID",
+  "MEDIA_SET_RID",
+  "MEDIA_SET_BRANCH",
+  "IMAGE_MEDIA_SET_RID",
+];
+
+let child = null;
+
+async function proxyIsHealthy() {
+  try {
+    const res = await fetch(HEALTH_URL, { signal: AbortSignal.timeout(800) });
+    return res.ok;
+  } catch {
+    return false;
+  }
+}
+
+function startProxy() {
+  const env = { ...process.env };
+  for (const key of Object.keys(env)) {
+    if (key.startsWith("OPENAI_") || key.startsWith("FOUNDRY_")) {
+      delete env[key];
+    }
+  }
+  for (const key of STRIPPED_ENV) delete env[key];
+  const log = openSync(LOG_FILE, "a");
+  try {
+    child = spawn(existsSync(NODE_BIN) ? NODE_BIN : "node", [PROXY_ENTRY], {
+      cwd: PROXY_DIR,
+      detached: true,
+      stdio: ["ignore", log, log],
+      env,
+    });
+    child.unref();
+  } finally {
+    closeSync(log);
+  }
+}
+
+function stopProxy() {
+  const proc = child;
+  child = null;
+  if (!proc || proc.exitCode !== null) return;
+  try {
+    proc.kill("SIGTERM");
+  } catch {
+    // Le proxy est déjà arrêté.
+  }
+}
+
+async function ensureProxy() {
+  if (!existsSync(PROXY_ENTRY)) return;
+  if (await proxyIsHealthy()) return;
+  startProxy();
+}
+
+function handleSignal(signal) {
+  process.removeListener(signal, handleSignal);
+  stopProxy();
+  if (process.listenerCount(signal) === 0) {
+    process.kill(process.pid, signal);
+  }
+}
+
+process.on("exit", stopProxy);
+for (const signal of ["SIGINT", "SIGTERM", "SIGHUP"]) {
+  process.on(signal, handleSignal);
+}
+
+export default async () => {
+  void ensureProxy().catch(() => {});
+  return {};
+};
